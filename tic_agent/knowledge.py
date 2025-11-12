@@ -89,7 +89,7 @@ async def _bulk_add_contents(
                 name=item["name"],
                 text_content=item["text_content"],
                 metadata=item.get("metadata"),
-                skip_if_exists=False,  # Disable skip_if_exists to avoid query issues
+                skip_if_exists=skip_if_exists,  # Use the calculated skip_if_exists value
             )
         except Exception as e:
             print(f"  ⚠️ Error loading {item['name']}: {e}")
