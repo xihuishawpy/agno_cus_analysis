@@ -50,6 +50,11 @@ class KnowledgeSettings:
     vector_dir: Path = field(
         default_factory=lambda: Path(os.getenv("KNOWLEDGE_CACHE_DIR", ".kb_cache/lancedb"))
     )
+    # ChromaDB specific settings
+    vector_backend: str = field(default_factory=lambda: os.getenv("VECTOR_BACKEND", "chroma"))
+    chroma_path: str = field(default_factory=lambda: os.getenv("CHROMA_PATH", ".kb_cache/chroma"))
+    chroma_collection: str = field(default_factory=lambda: os.getenv("CHROMA_COLLECTION", "tic_excel_documents"))
+    chroma_persistent: bool = field(default_factory=lambda: _env_bool("CHROMA_PERSISTENT", True))
     embedder_id: str = field(
         default_factory=lambda: os.getenv("KNOWLEDGE_EMBEDDER", "text-embedding-v3")
     )

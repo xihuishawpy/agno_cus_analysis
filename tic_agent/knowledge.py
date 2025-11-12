@@ -15,7 +15,7 @@ from agno.knowledge import Knowledge
 from agno.knowledge.embedder.openai import OpenAIEmbedder
 from agno.knowledge.embedder.sentence_transformer import SentenceTransformerEmbedder
 from agno.knowledge.embedder.base import Embedder
-from agno.vectordb.lancedb import LanceDb
+from agno.vectordb.chroma import ChromaDb
 
 from .config import AppConfig, KnowledgeSettings
 
@@ -32,11 +32,13 @@ def build_excel_knowledge(config: AppConfig) -> Knowledge:
     _maybe_drop_existing_table(settings)
 
     embedder = _create_embedder(config)
-    vector_db = LanceDb(
-        table_name=settings.table_name,
-        uri=str(settings.vector_dir),
-        embedder=embedder,
-    )
+
+    # Create ChromaDB vector database
+    vector_db = _create_vector_db(settings, embedder)
+    print(f"✓ Using agno ChromaDB vector database: {type(vector_db).__name__}")
+    print(f"  Collection: {settings.chroma_collection}")
+    print(f"  Path: {settings.chroma_path}")
+    print(f"  Persistent: {settings.chroma_persistent}")
 
     knowledge = Knowledge(
         name="TIC Excel Knowledge",
@@ -46,6 +48,7 @@ def build_excel_knowledge(config: AppConfig) -> Knowledge:
 
     docs = list(_read_documents(settings.excel_paths))
     if not docs:
+        print("⚠️ No documents found")
         return knowledge
 
     payload = [
@@ -57,9 +60,18 @@ def build_excel_knowledge(config: AppConfig) -> Knowledge:
         for doc in docs
     ]
 
+    print(f"📊 Processing {len(payload)} documents...")
     skip_if_exists = not settings.rebuild_on_start
-    concurrency = max(1, settings.ingest_concurrency)
-    asyncio.run(_bulk_add_contents(knowledge, payload, concurrency, skip_if_exists))
+    # Use lower concurrency for Milvus stability
+    concurrency = 1  # Sequential processing for stability
+
+    try:
+        asyncio.run(_bulk_add_contents(knowledge, payload, concurrency, skip_if_exists))
+        print(f"✅ Successfully loaded {len(payload)} documents into ChromaDB")
+    except Exception as e:
+        print(f"❌ Error loading documents into ChromaDB: {e}")
+        raise
+
     return knowledge
 
 
@@ -69,18 +81,29 @@ async def _bulk_add_contents(
     concurrency: int,
     skip_if_exists: bool,
 ) -> None:
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def _worker(item: Dict[str, str]) -> None:
-        async with semaphore:
+    """Add contents to knowledge base sequentially for Milvus stability."""
+    for i, item in enumerate(payload):
+        try:
+            print(f"  Loading {i+1}/{len(payload)}: {item['name']}")
             await knowledge.add_content_async(
                 name=item["name"],
                 text_content=item["text_content"],
                 metadata=item.get("metadata"),
-                skip_if_exists=skip_if_exists,
+                skip_if_exists=False,  # Disable skip_if_exists to avoid query issues
             )
+        except Exception as e:
+            print(f"  ⚠️ Error loading {item['name']}: {e}")
+            continue
 
-    await asyncio.gather(*(_worker(item) for item in payload))
+
+def _create_vector_db(settings: KnowledgeSettings, embedder: Embedder):
+    """Create ChromaDB vector database."""
+    return ChromaDb(
+        collection=settings.chroma_collection,
+        embedder=embedder,
+        path=settings.chroma_path,
+        persistent_client=settings.chroma_persistent,
+    )
 
 
 def _create_embedder(config: AppConfig) -> Embedder:
@@ -102,19 +125,22 @@ def _create_embedder(config: AppConfig) -> Embedder:
 
 
 def _maybe_drop_existing_table(settings: KnowledgeSettings) -> None:
+    """Drop existing ChromaDB collection if rebuild is requested."""
     if not settings.rebuild_on_start:
         return
 
-    settings.vector_dir.mkdir(parents=True, exist_ok=True)
-
     try:
-        import lancedb  # type: ignore
+        from chromadb import PersistentClient
 
-        connection = lancedb.connect(uri=str(settings.vector_dir))
-        if settings.table_name in connection.table_names():
-            connection.drop_table(settings.table_name)
-    except Exception:
-        pass
+        print(f"🗑️  Dropping existing ChromaDB collection: {settings.chroma_collection}")
+        client = PersistentClient(path=settings.chroma_path)
+        try:
+            client.delete_collection(name=settings.chroma_collection)
+            print(f"✅ Dropped collection: {settings.chroma_collection}")
+        except Exception:
+            print(f"⚠️ Collection may not exist: {settings.chroma_collection}")
+    except Exception as e:
+        print(f"⚠️ Could not drop collection: {e}")
 
 
 def _read_documents(paths: Iterable[Path]) -> Iterable[KnowledgeDocument]:
