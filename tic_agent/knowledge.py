@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import asyncio
 import json
@@ -29,8 +30,6 @@ class KnowledgeDocument:
 
 def build_excel_knowledge(config: AppConfig) -> Knowledge:
     settings = config.knowledge
-    _maybe_drop_existing_table(settings)
-
     embedder = _create_embedder(config)
 
     # Create ChromaDB vector database
@@ -46,9 +45,21 @@ def build_excel_knowledge(config: AppConfig) -> Knowledge:
         vector_db=vector_db,
     )
 
+    file_signatures = _collect_file_signatures(settings.excel_paths)
+    manifest = _load_manifest(settings)
+    rebuild_reason = _determine_rebuild_reason(settings, manifest, file_signatures)
+
+    if not rebuild_reason:
+        print("↩️ Excel 源文件无变化，复用已有向量数据库。")
+        return knowledge
+
+    print(f"🔄 触发向量库重建：{rebuild_reason}")
+    _maybe_drop_existing_table(settings)
+
     docs = list(_read_documents(settings.excel_paths))
     if not docs:
         print("⚠️ No documents found")
+        _save_manifest(settings, file_signatures)
         return knowledge
 
     payload = [
@@ -61,13 +72,13 @@ def build_excel_knowledge(config: AppConfig) -> Knowledge:
     ]
 
     print(f"📊 Processing {len(payload)} documents...")
-    skip_if_exists = not settings.rebuild_on_start
-    # Use lower concurrency for Milvus stability
-    concurrency = 1  # Sequential processing for stability
+    concurrency = max(1, settings.ingest_concurrency)
+    print(f"  Concurrency: {concurrency}")
 
     try:
-        asyncio.run(_bulk_add_contents(knowledge, payload, concurrency, skip_if_exists))
+        asyncio.run(_bulk_add_contents(knowledge, payload, concurrency, skip_if_exists=False))
         print(f"✅ Successfully loaded {len(payload)} documents into ChromaDB")
+        _save_manifest(settings, file_signatures)
     except Exception as e:
         print(f"❌ Error loading documents into ChromaDB: {e}")
         raise
@@ -81,19 +92,25 @@ async def _bulk_add_contents(
     concurrency: int,
     skip_if_exists: bool,
 ) -> None:
-    """Add contents to knowledge base sequentially for Milvus stability."""
-    for i, item in enumerate(payload):
-        try:
-            print(f"  Loading {i+1}/{len(payload)}: {item['name']}")
-            await knowledge.add_content_async(
-                name=item["name"],
-                text_content=item["text_content"],
-                metadata=item.get("metadata"),
-                skip_if_exists=skip_if_exists,  # Use the calculated skip_if_exists value
-            )
-        except Exception as e:
-            print(f"  ⚠️ Error loading {item['name']}: {e}")
-            continue
+    """Add contents to knowledge base with configurable concurrency."""
+
+    semaphore = asyncio.Semaphore(concurrency)
+    total = len(payload)
+
+    async def _process(idx: int, item: Dict[str, Any]):
+        async with semaphore:
+            try:
+                print(f"  Loading {idx + 1}/{total}: {item['name']}")
+                await knowledge.add_content_async(
+                    name=item["name"],
+                    text_content=item["text_content"],
+                    metadata=item.get("metadata"),
+                    skip_if_exists=skip_if_exists,
+                )
+            except Exception as exc:
+                print(f"  ⚠️ Error loading {item['name']}: {exc}")
+
+    await asyncio.gather(*(_process(i, item) for i, item in enumerate(payload)))
 
 
 def _create_vector_db(settings: KnowledgeSettings, embedder: Embedder):
@@ -223,3 +240,63 @@ def _clean(value) -> str | None:
         return None
     text = str(value).strip()
     return text if text else None
+
+
+def _collect_file_signatures(paths: Iterable[Path]) -> Dict[str, Dict[str, int]]:
+    signatures: Dict[str, Dict[str, int]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        signatures[str(path.resolve())] = {
+            "mtime_ns": int(stat.st_mtime_ns),
+            "size": int(stat.st_size),
+        }
+    return signatures
+
+
+def _determine_rebuild_reason(
+    settings: KnowledgeSettings,
+    manifest: Optional[Dict[str, Any]],
+    current_signatures: Dict[str, Dict[str, int]],
+) -> Optional[str]:
+    if settings.rebuild_on_start:
+        return "配置开启强制重建 (KNOWLEDGE_REBUILD=1)"
+    if manifest is None:
+        return "首次构建向量库"
+    previous_files = manifest.get("files") or {}
+    if previous_files != current_signatures:
+        return "检测到 Excel 源文件变更"
+    return None
+
+
+def _manifest_path(settings: KnowledgeSettings) -> Path:
+    return settings.vector_dir / "excel_knowledge_manifest.json"
+
+
+def _load_manifest(settings: KnowledgeSettings) -> Optional[Dict[str, Any]]:
+    path = _manifest_path(settings)
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:
+        print(f"⚠️ 无法读取知识库 manifest: {exc}")
+        return None
+
+
+def _save_manifest(settings: KnowledgeSettings, files: Dict[str, Dict[str, int]]) -> None:
+    path = _manifest_path(settings)
+    data = {
+        "files": files,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"⚠️ 无法写入知识库 manifest: {exc}")
